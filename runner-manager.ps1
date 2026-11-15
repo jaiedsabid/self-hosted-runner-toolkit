@@ -300,7 +300,16 @@ function Select-Account($title) {
 function Grant-OrgPermission {
   $login = Select-Account "Give which account permission to manage organization runners?"
   if (-not $login) { return }
-  Invoke-GhInteractive @("auth", "switch", "-h", "github.com", "-u", $login) | Out-Null
+  # "gh auth refresh" only works on GitHub CLI's active account, so switch to
+  # $login for the refresh and switch back afterwards
+  $prev = Get-GhActiveAccount
+  $switched = $false
+  if ($prev -ne $login) {
+    if ((Invoke-GhInteractive @("auth", "switch", "-h", "github.com", "-u", $login)) -ne 0) {
+      Fail "Couldn't switch GitHub CLI to $login."; return
+    }
+    $switched = $true
+  }
   Info "A browser window will open to approve the extra permission (admin:org)."
   if ((Invoke-GhInteractive @("auth", "refresh", "-h", "github.com", "-s", "admin:org")) -eq 0) {
     $script:Tokens.Remove($login)
@@ -308,6 +317,25 @@ function Grant-OrgPermission {
   } else {
     Fail "That didn't complete."
   }
+  if ($switched -and $prev) {
+    if ((Invoke-GhInteractive @("auth", "switch", "-h", "github.com", "-u", $prev)) -ne 0) {
+      Warn "GitHub CLI's active account is now $login (couldn't switch back to $prev)."
+    }
+  }
+}
+
+# GitHub CLI's own active account (read locally, no network needed)
+function Get-GhActiveAccount {
+  $saved = $env:GH_TOKEN
+  Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+  $lines = @(gh auth status -h github.com 2>&1 | ForEach-Object { "$_" })
+  if ($saved) { $env:GH_TOKEN = $saved }
+  $last = $null
+  foreach ($l in $lines) {
+    if ($l -match '\baccount\s+([A-Za-z0-9][A-Za-z0-9-]*)') { $last = $Matches[1] }
+    if ($l -match 'Active account:\s*true') { return $last }
+  }
+  return $null
 }
 
 function Remove-Account {
@@ -388,7 +416,27 @@ function Initialize-Account {
     Fail "Update GitHub CLI (winget upgrade --id GitHub.cli) or sign in again (gh auth login)."
     return $false
   }
+
+  # Having a saved token doesn't mean GitHub still accepts it
+  if ((Get-SignInState) -eq "expired") {
+    Fail "GitHub no longer accepts the sign-in for $($Config.ActiveAccount) (it expired or was revoked)."
+    if ($script:Quiet) { Fail "Run the script without options once and sign in again."; return $false }
+    if ((Read-Host "Sign in again now? (y/n)") -ne "y") { return $false }
+    Add-Account
+    if ((Get-SignInState) -eq "expired") { Fail "The sign-in still isn't accepted."; return $false }
+  }
   return $true
+}
+
+# Asks GitHub whether the current token works: "ok", "expired", or "unknown"
+# (unknown = couldn't tell, e.g. no network; a warning is shown and the script carries on)
+function Get-SignInState {
+  $out = @(gh api user --jq .login 2>&1 | ForEach-Object { "$_" })
+  if ($LASTEXITCODE -eq 0) { return "ok" }
+  $msg = $out -join " "
+  if ($msg -match 'HTTP 401|Bad credentials') { return "expired" }
+  Warn "Couldn't check the GitHub sign-in: $(@($out)[0])"
+  return "unknown"
 }
 
 # Older versions stored bare repo names (e.g. "my-repo"). Convert them to owner/repo.
@@ -632,8 +680,18 @@ function Select-Repos {
   if ([string]::IsNullOrWhiteSpace($owner)) { $owner = $Config.ActiveAccount }
   Use-Account $Config.ActiveAccount
   Info "Loading repos where $($Config.ActiveAccount) is an admin..."
-  $json = (gh repo list $owner.Trim() --limit 300 --json "nameWithOwner,viewerPermission,isArchived" 2>$null) -join "`n"
-  if ($LASTEXITCODE -ne 0 -or -not $json) { Fail "Could not list repos for $owner."; return @() }
+  # Keep gh's error message so a failed call (expired sign-in, no network,
+  # unknown owner) says why instead of just failing
+  $out = @(gh repo list $owner.Trim() --limit 300 --json "nameWithOwner,viewerPermission,isArchived" 2>&1)
+  $code = $LASTEXITCODE
+  $errType = [System.Management.Automation.ErrorRecord]
+  $json = @($out | Where-Object { $_ -isnot $errType } | ForEach-Object { "$_" }) -join "`n"
+  if ($code -ne 0 -or -not $json) {
+    Fail "Could not list repos for $owner."
+    $why = @($out | Where-Object { $_ -is $errType } | ForEach-Object { "$_" } | Select-Object -First 3) -join " "
+    if ($why) { Write-Host "  GitHub CLI said: $why" -ForegroundColor DarkGray }
+    return @()
+  }
 
   # Parentheses matter: Windows PowerShell 5.1 passes the parsed JSON array down the
   # pipeline as ONE object, so without them the filter below sees the whole list at once.

@@ -340,6 +340,8 @@ jobs:
 | `swift`/`xcodebuild` fails on Windows or Linux | Mac apps need macOS | Use `runs-on: [self-hosted, macOS]` |
 | Can't add an organization runner | Not an org owner, or missing `admin:org` | **A → Let an account manage organization runners** |
 | "Couldn't get a sign-in token" | GitHub CLI older than 2.40, or sign-in expired | Update GitHub CLI, or **A → Sign in** again |
+| "GitHub no longer accepts the sign-in for …" | The account's sign-in expired or was revoked | Answer **y** to sign in again, or use **A → Sign in to another account** with the same account |
+| "Could not list repos for …" | The line below it shows GitHub CLI's reason: wrong user/org name, no network, or a sign-in problem | Fix what it says, or choose **Type a repo** instead |
 | Checksum doesn't match | Wrong file or broken download | Download again, and copy the checksum for the exact file |
 
 ---
