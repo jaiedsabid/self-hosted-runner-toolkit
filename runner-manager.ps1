@@ -464,10 +464,25 @@ function Test-Access($key) {
     }
     return $true
   }
-  $admin = gh api "repos/$key" --jq .permissions.admin 2>$null
-  if ($LASTEXITCODE -ne 0) { Fail "Repo $key not found (or $login can't see it). Check the name."; return $false }
-  if ("$admin" -ne "true") { Fail "$login needs admin access to $key to manage its runner."; return $false }
+  # (no double quotes in the jq filter: Windows PowerShell 5.1 doesn't pass them through to programs)
+  $info = gh api "repos/$key" --jq '[.permissions.admin, .private] | map(tostring) | join(",")' 2>$null
+  if ($LASTEXITCODE -ne 0 -or -not $info) { Fail "Repo $key not found (or $login can't see it). Check the name."; return $false }
+  $admin, $private = "$info".Trim() -split ','
+  if ($admin -ne "true") { Fail "$login needs admin access to $key to manage its runner."; return $false }
+  if ($private -ne "true" -and -not (Confirm-PublicRepo $key)) { return $false }
   return $true
+}
+
+# A runner on a public repo lets anyone who opens a pull request from a fork run code on this machine
+function Confirm-PublicRepo($key) {
+  Warn "WARNING: $key is a PUBLIC repo."
+  Warn "Anyone can fork it and open a pull request whose workflow runs on this machine,"
+  Warn "with access to its files and network. GitHub advises against self-hosted runners on public repos."
+  if ($script:Quiet) {
+    Fail "Not adding a runner to a public repo in command-line mode. Run the script without options to confirm."
+    return $false
+  }
+  return ((Read-Host "Type 'public' to add the runner anyway, or press Enter to cancel") -eq "public")
 }
 
 # =====================================================================
@@ -510,8 +525,16 @@ function Get-FolderSizeMB($path) {
   return [math]::Round(($sum / 1MB), 1)
 }
 
+# Deletes a runner folder. Refuses system and profile folders (see Get-ProtectedReason)
+# and anything that doesn't look like a runner folder (no config.cmd or .runner inside).
 function Remove-FolderFully($dir) {
-  Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+  if (-not (Test-Path -LiteralPath $dir)) { return $true }
+  $why = Get-ProtectedReason $dir
+  if ($why) { Fail "Refusing to delete $dir ($why)."; return $false }
+  if (-not (Test-Path -LiteralPath (Join-Path $dir "config.cmd")) -and -not (Test-Path -LiteralPath (Join-Path $dir ".runner"))) {
+    Fail "Refusing to delete ${dir}: it doesn't look like a runner folder."; return $false
+  }
+  Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
   if (Test-Path $dir) { cmd /c rd /s /q "\\?\$dir" 2>$null }   # handles very long paths
   return -not (Test-Path $dir)
 }
@@ -719,16 +742,152 @@ function Resolve-Targets($name) {
 }
 
 # =====================================================================
+#  Folder permissions
+#  Folders created under C:\ let every signed-in user change files in them. This script
+#  runs as Administrator and runner services run its runner folders' programs, so those
+#  folders must only be writable by Administrators, SYSTEM and the runner's service account.
+# =====================================================================
+# Everyone, Authenticated Users, Users, INTERACTIVE
+$script:BroadSids = @("S-1-1-0", "S-1-5-11", "S-1-5-32-545", "S-1-5-4")
+
+# The account runner services run as, in a form icacls accepts
+function Get-ServiceIdentity {
+  if (-not $Config.ServiceAccount) { return "*S-1-5-20" }   # NETWORK SERVICE
+  if ($Config.ServiceAccount -like ".\*") { return "$env:COMPUTERNAME\$($Config.ServiceAccount.Substring(2))" }
+  return $Config.ServiceAccount
+}
+
+# True if any ordinary user of this PC can change files in $path
+function Test-WritableByOthers($path) {
+  if (-not (Test-Path -LiteralPath $path)) { return $false }
+  try { $acl = Get-Acl -LiteralPath $path } catch { return $false }
+  $write = [Security.AccessControl.FileSystemRights]"WriteData, AppendData, WriteAttributes, WriteExtendedAttributes, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership"
+  foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+    if ($rule.AccessControlType -ne "Allow") { continue }
+    if ($script:BroadSids -notcontains $rule.IdentityReference.Value) { continue }
+    if (($rule.FileSystemRights -band $write) -ne 0) { return $true }
+  }
+  return $false
+}
+
+# Why $path must never be deleted or have its permissions replaced (or $null if it's fine):
+# drive roots, Windows, Program Files, ProgramData, the Users folder and user profiles
+function Get-ProtectedReason($path) {
+  if (-not $path) { return "the path is empty" }
+  try { $full = [IO.Path]::GetFullPath($path).TrimEnd('\') } catch { return "the path isn't valid" }
+  if ($full -match '^[A-Za-z]:$' -or $full -like '\\*') { return "it's a whole drive or a network path" }
+  $exact = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, $env:PUBLIC,
+             (Split-Path $env:USERPROFILE -Parent)) | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') }
+  if ($exact -contains $full) { return "it's a Windows system folder" }
+  if ($env:SystemRoot -and ($full -eq $env:SystemRoot.TrimEnd('\') -or $full -like "$($env:SystemRoot.TrimEnd('\'))\*")) { return "it's inside the Windows folder" }
+  # A user profile folder itself (C:\Users\name), or anything that contains this user's profile
+  $usersRoot = (Split-Path $env:USERPROFILE -Parent).TrimEnd('\')
+  if ((Split-Path $full -Parent) -eq $usersRoot) { return "it's a user profile folder" }
+  if ("$($env:USERPROFILE.TrimEnd('\'))\" -like "$full\*") { return "it contains your user profile" }
+  return $null
+}
+
+# True if $path holds nothing but files matching $names, so changing its permissions affects nothing else
+function Test-OnlyOurFiles($path, $names) {
+  foreach ($i in Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue) {
+    if (-not ($names | Where-Object { $i.Name -like $_ })) { return $false }
+  }
+  return $true
+}
+
+# Limits $path to Administrators and SYSTEM (full control), plus $writers (modify).
+# Files inside get the same permissions. Returns $true on success.
+function Protect-Folder($path, $writers = @()) {
+  $why = Get-ProtectedReason $path
+  if ($why) { Warn "Not changing permissions of $path ($why)."; return $false }
+  New-Item -ItemType Directory -Force -Path $path | Out-Null
+  $icaclsArgs = @($path, "/inheritance:r", "/grant:r", "*S-1-5-32-544:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F")
+  foreach ($w in $writers) { $icaclsArgs += "$($w):(OI)(CI)M" }
+  & icacls @icaclsArgs /Q | Out-Null
+  if ($LASTEXITCODE -ne 0) { Warn "Couldn't limit who can change files in $path."; return $false }
+  # Make everything already inside follow the folder's new permissions
+  if (Get-ChildItem -LiteralPath $path -Force | Select-Object -First 1) {
+    & icacls (Join-Path $path "*") /reset /T /C /Q | Out-Null
+  }
+  return $true
+}
+
+# The folders that matter: this script's own folder, the runner download folder and each runner folder.
+# Returns a list of @{ Path; Writers; What }
+# Names = what a folder may hold for us to safely lock it down ($null = anything; runner folders)
+$script:ScriptFolderFiles = @("runner-manager.ps1", "runner-manager.sh", "runners-config.json", "runner-manager.conf",
+                              "README.md", "LICENSE", ".git", ".gitattributes", ".gitignore")
+$script:ZipFolderFiles    = @("*.zip", "*.zip.part")
+
+function Get-SensitiveFolders {
+  $list = @(
+    @{ Path = $ScriptDir; Writers = @(); Names = $script:ScriptFolderFiles; What = "this script and its settings" },
+    @{ Path = (Split-Path $Config.ZipPath -Parent); Writers = @(); Names = $script:ZipFolderFiles; What = "the runner download" }
+  )
+  foreach ($key in Get-AllRunnerNames) {
+    $dir = Get-RunnerDir $key
+    if (Test-Path -LiteralPath $dir) { $list += @{ Path = $dir; Writers = @(Get-RunnerServiceIdentity $key); Names = $null; What = "runner $(Get-DisplayName $key)" } }
+  }
+  return $list
+}
+
+# The account an installed runner's service really runs as (it may predate a change in Settings)
+function Get-RunnerServiceIdentity($key) {
+  $m = (Get-MachineRunners)[$key]
+  if (-not $m) { return (Get-ServiceIdentity) }
+  $cim = Get-CimInstance Win32_Service -Filter "Name='$($m.ServiceName)'" -ErrorAction SilentlyContinue
+  $who = "$($cim.StartName)"
+  if (-not $who -or $who -match 'NETWORK ?SERVICE') { return "*S-1-5-20" }
+  if ($who -eq "LocalSystem") { return "*S-1-5-18" }
+  if ($who -like ".\*") { return "$env:COMPUTERNAME\$($who.Substring(2))" }
+  return $who
+}
+
+# Locks down one folder after asking. A folder that also holds other things isn't changed;
+# you're asked to move our files to a folder of their own instead.
+function Repair-OneFolder($f) {
+  Warn "  Other users of this PC can change files in $($f.Path) ($($f.What))."
+  if ($f.Names -and -not (Test-OnlyOurFiles $f.Path $f.Names)) {
+    Warn "  That folder holds other files too, so its permissions weren't changed. Move $($f.What) to a"
+    Warn "  folder of its own that only Administrators can change, e.g. $env:ProgramFiles\runner-manager."
+    return
+  }
+  if (Confirm-Fix "Allow only Administrators$(if ($f.Writers.Count) { ' and the runner service' }) to change it?") {
+    if (Protect-Folder $f.Path $f.Writers) { Ok "  Done." }
+  }
+}
+
+# Reports folders other users can change, and offers to lock them down
+function Repair-FolderPermissions {
+  $found = 0
+  foreach ($f in Get-SensitiveFolders) {
+    if (-not (Test-WritableByOthers $f.Path)) { continue }
+    $found++
+    Repair-OneFolder $f
+  }
+  if ($found -eq 0) { Ok "  Folder permissions: only Administrators can change the script, download and runner folders" }
+}
+
+# Creates the runner download folder locked down, and won't trust a saved download in a folder others can change
+function Initialize-ZipFolder {
+  $dir = Split-Path $Config.ZipPath -Parent
+  if (-not (Test-Path -LiteralPath $dir)) { Protect-Folder $dir | Out-Null; return }
+  if (-not (Test-WritableByOthers $dir)) { return }
+  if (Test-OnlyOurFiles $dir $script:ZipFolderFiles) { Protect-Folder $dir | Out-Null }
+  else { Warn "Other users of this PC can change files in $dir. Choose a folder of its own for the runner download (Settings)." }
+}
+
+# =====================================================================
 #  Runner download
 # =====================================================================
-# Checks a downloaded file is a real runner zip (and matches the checksum, if one was given)
+# Every runner zip is checked against a SHA-256 checksum before it's used. The checksum comes
+# from GitHub's release data when the file is an official release, otherwise you paste it.
 function Test-RunnerArchive($file, $sum) {
-  if ("$sum" -match '([0-9a-fA-F]{64})') {
-    $expected = $Matches[1]
-    $actual = (Get-FileHash $file -Algorithm SHA256).Hash
-    if ($actual -ne $expected) { Fail "Checksum doesn't match. The file was not used."; return $false }
-    Ok "Checksum OK."
-  }
+  if ("$sum" -notmatch '([0-9a-fA-F]{64})') { Fail "No checksum to check the file against. The file was not used."; return $false }
+  $expected = $Matches[1]
+  $actual = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+  if ($actual -ne $expected) { Fail "Checksum doesn't match. The file was not used."; return $false }
+  Ok "Checksum OK."
   try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [IO.Compression.ZipFile]::OpenRead($file)
@@ -741,6 +900,25 @@ function Test-RunnerArchive($file, $sum) {
   return $true
 }
 
+# GitHub's published SHA-256 for an official runner file name, e.g.
+# actions-runner-win-x64-2.330.0.zip ($null if it isn't an official file)
+function Get-OfficialDigest($name) {
+  if ($name -notmatch '^actions-runner-[a-z0-9]+-[a-z0-9]+-(\d+\.\d+\.\d+)\.zip$') { return $null }
+  $json = (gh api "repos/actions/runner/releases/tags/v$($Matches[1])" 2>$null) -join "`n"
+  if ($LASTEXITCODE -ne 0 -or -not $json) { return $null }
+  $asset = ($json | ConvertFrom-Json).assets | Where-Object { $_.name -eq $name } | Select-Object -First 1
+  if (-not $asset -or -not $asset.digest) { return $null }
+  return ($asset.digest -replace '^sha256:', '')
+}
+
+# The checksum for a file you supplied: GitHub's own if it's an official release, else you paste one
+function Get-ChecksumFor($name) {
+  $sum = Get-OfficialDigest $name
+  if ($sum) { Info "Using GitHub's published checksum for $name."; return $sum }
+  Warn "$name isn't a file name from GitHub's runner releases, so its checksum can't be looked up."
+  return (Read-Host "SHA-256 checksum to verify (required; from the release page or whoever gave you the file)")
+}
+
 function Get-LatestRunnerZip {
   Info "Finding the latest GitHub runner ($RunnerPlatform)..."
   $json = (gh api repos/actions/runner/releases/latest 2>$null) -join "`n"
@@ -749,13 +927,14 @@ function Get-LatestRunnerZip {
   $asset = ($json | ConvertFrom-Json).assets |
     Where-Object { $_.name -match "^actions-runner-$RunnerPlatform-[\d.]+\.zip$" } | Select-Object -First 1
   if (-not $asset) { Fail "Could not find the $RunnerPlatform runner download."; return $false }
+  if (-not $asset.digest) { Fail "GitHub didn't publish a checksum for $($asset.name), so it can't be verified."; return $false }
 
-  New-Item -ItemType Directory -Force -Path (Split-Path $Config.ZipPath -Parent) | Out-Null
+  Initialize-ZipFolder
   $part = "$($Config.ZipPath).part"
   Info "Downloading $($asset.name)..."
   try { Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $part -UseBasicParsing }
   catch { Fail "Download failed: $($_.Exception.Message)"; Remove-Item $part -Force -ErrorAction SilentlyContinue; return $false }
-  if (-not (Test-RunnerArchive $part "")) { Remove-Item $part -Force -ErrorAction SilentlyContinue; return $false }
+  if (-not (Test-RunnerArchive $part $asset.digest)) { Remove-Item $part -Force -ErrorAction SilentlyContinue; return $false }
   Move-Item $part $Config.ZipPath -Force
   Ok "Saved to $($Config.ZipPath)"
   return $true
@@ -766,18 +945,23 @@ function Get-RunnerZipFromLink {
   Info "(choose Windows, $($RunnerPlatform.Substring(4))), or from https://github.com/actions/runner/releases"
   $url = "$(Read-Host 'Download link')".Trim().Trim('"')
   if ($url -notmatch '^https://') { Fail "The link should start with https://"; return $false }
+  $official = $url -like "https://github.com/actions/runner/releases/download/*"
+  if (-not $official) { Warn "This link isn't from github.com/actions/runner/releases. You'll need the file's SHA-256 checksum." }
   if ($url -notmatch "actions-runner-$RunnerPlatform-") {
     Warn "This link doesn't look like the $RunnerPlatform runner (expected 'actions-runner-$RunnerPlatform-' in it)."
     if ((Read-Host "Use it anyway? (y/n)") -ne "y") { return $false }
   }
+  # Only trust GitHub's published checksum when the file really comes from GitHub's releases
+  $sum = if ($official) { Get-ChecksumFor (Split-Path ($url -replace '\?.*$', '') -Leaf) }
+         else           { Read-Host "SHA-256 checksum to verify (required)" }
+  if ([string]::IsNullOrWhiteSpace($sum)) { Fail "A checksum is needed to use this file."; return $false }
 
-  New-Item -ItemType Directory -Force -Path (Split-Path $Config.ZipPath -Parent) | Out-Null
+  Initialize-ZipFolder
   $part = "$($Config.ZipPath).part"
   Info "Downloading..."
   try { Invoke-WebRequest -Uri $url -OutFile $part -UseBasicParsing }
   catch { Fail "Download failed. Check the link. ($($_.Exception.Message))"; Remove-Item $part -Force -ErrorAction SilentlyContinue; return $false }
 
-  $sum = Read-Host "SHA-256 checksum to verify (optional, shown on GitHub's release page; Enter to skip)"
   if (-not (Test-RunnerArchive $part $sum)) { Remove-Item $part -Force -ErrorAction SilentlyContinue; return $false }
   Move-Item $part $Config.ZipPath -Force
   Ok "Saved to $($Config.ZipPath)"
@@ -786,11 +970,12 @@ function Get-RunnerZipFromLink {
 
 function Get-RunnerZipFromFile {
   $src = "$(Read-Host 'Path to the runner .zip file')".Trim().Trim('"')
-  if (-not (Test-Path $src -PathType Leaf)) { Fail "File not found: $src"; return $false }
-  $sum = Read-Host "SHA-256 checksum to verify (optional; Enter to skip)"
+  if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { Fail "File not found: $src"; return $false }
+  $sum = Get-ChecksumFor (Split-Path $src -Leaf)
+  if ([string]::IsNullOrWhiteSpace($sum)) { Fail "A checksum is needed to use this file."; return $false }
   if (-not (Test-RunnerArchive $src $sum)) { return $false }
-  New-Item -ItemType Directory -Force -Path (Split-Path $Config.ZipPath -Parent) | Out-Null
-  Copy-Item $src $Config.ZipPath -Force
+  Initialize-ZipFolder
+  Copy-Item -LiteralPath $src $Config.ZipPath -Force
   Unblock-File $Config.ZipPath -ErrorAction SilentlyContinue   # files downloaded in a browser are marked as "from the internet"
   Ok "Copied to $($Config.ZipPath)"
   return $true
@@ -798,7 +983,12 @@ function Get-RunnerZipFromFile {
 
 # Makes sure the runner zip is there: download it, use a link you paste, or a file you have
 function Get-RunnerZip {
-  if (Test-Path $Config.ZipPath) { return $true }
+  if (Test-Path $Config.ZipPath) {
+    # A saved download in a folder other users can change may have been swapped; get a fresh one
+    if (-not (Test-WritableByOthers (Split-Path $Config.ZipPath -Parent))) { return $true }
+    Warn "Other users of this PC could have changed the saved runner download. Getting a fresh, verified copy."
+    Remove-Item -LiteralPath $Config.ZipPath -Force -ErrorAction SilentlyContinue
+  }
   if ($script:Quiet) { return (Get-LatestRunnerZip) }
 
   Warn "The runner download ($RunnerPlatform) wasn't found at:"
@@ -880,10 +1070,11 @@ function Install-Runner($key, $dir) {
   $extra = @()
   $labels = @(Get-SavedLabels $key)
   if ($labels.Count) { $extra += @("--labels", ($labels -join ",")) }
+  $pw = $null
   if ($Config.ServiceAccount) {
     $pw = Get-ServicePassword
     if (-not $pw) { Fail "No password entered."; return $false }
-    $extra += @("--windowslogonaccount", $Config.ServiceAccount, "--windowslogonpassword", $pw)
+    $extra += @("--windowslogonaccount", $Config.ServiceAccount)
   }
 
   Info "Setting up $label in $dir (as $(Get-KeyAccount $key)) ..."
@@ -891,14 +1082,24 @@ function Install-Runner($key, $dir) {
   $token = gh api -X POST "$(Get-ApiBase $key)/actions/runners/registration-token" --jq .token 2>$null
   if ($LASTEXITCODE -ne 0 -or -not $token) { Fail "Could not get a registration token for $label."; return $false }
 
-  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  # Only Administrators, SYSTEM and the runner service may change the runner's files
+  if (-not (Protect-Folder $dir @(Get-ServiceIdentity))) { Fail "Setup stopped: couldn't secure $dir."; return $false }
   Expand-Archive $Config.ZipPath -DestinationPath $dir -Force
 
+  # The token and password go in the environment, not on the command line, where Windows
+  # process logging and security tools would record them. The runner reads
+  # ACTIONS_RUNNER_INPUT_<option> and removes it from its environment.
+  $env:ACTIONS_RUNNER_INPUT_TOKEN = $token
+  if ($pw) { $env:ACTIONS_RUNNER_INPUT_WINDOWSLOGONPASSWORD = $pw }
   Push-Location $dir
-  & .\config.cmd --unattended --url (Get-TargetUrl $key) --token $token `
-    --name (Get-NewRunnerName $key) --runasservice --replace @extra | Out-Host
-  $code = $LASTEXITCODE
-  Pop-Location
+  try {
+    & .\config.cmd --unattended --url (Get-TargetUrl $key) `
+      --name (Get-NewRunnerName $key) --runasservice --replace @extra | Out-Host
+    $code = $LASTEXITCODE
+  } finally {
+    Pop-Location
+    Remove-Item Env:ACTIONS_RUNNER_INPUT_TOKEN, Env:ACTIONS_RUNNER_INPUT_WINDOWSLOGONPASSWORD -ErrorAction SilentlyContinue
+  }
   Reset-MachineCache
 
   if ($code -ne 0) {
@@ -929,9 +1130,10 @@ function Remove-Runner($key, [switch]$Forget) {
   if (Test-Path (Join-Path $dir ".runner")) {
     $token = gh api -X POST "$(Get-ApiBase $key)/actions/runners/remove-token" --jq .token 2>$null
     if ($LASTEXITCODE -eq 0 -and $token) {
+      $env:ACTIONS_RUNNER_INPUT_TOKEN = $token   # not on the command line (see Install-Runner)
       Push-Location $dir
-      & .\config.cmd remove --token $token | Out-Host
-      Pop-Location
+      try { & .\config.cmd remove | Out-Host }
+      finally { Pop-Location; Remove-Item Env:ACTIONS_RUNNER_INPUT_TOKEN -ErrorAction SilentlyContinue }
     }
   }
 
@@ -1351,6 +1553,8 @@ function Invoke-HealthCheck {
     }
   }
 
+  Repair-FolderPermissions
+
   $fsKey = "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem"
   $lp = (Get-ItemProperty $fsKey -Name LongPathsEnabled -ErrorAction SilentlyContinue).LongPathsEnabled
   if ($lp -eq 1) { Ok "  Long paths: enabled" }
@@ -1543,11 +1747,12 @@ function Show-Settings {
       "2" {
         $zipFolder = Read-Folder "Folder to keep the runner download in" (Split-Path $Config.ZipPath -Parent)
         if ($zipFolder) {
-          New-Item -ItemType Directory -Force -Path $zipFolder | Out-Null
           $newZip = Join-Path $zipFolder "runner.zip"
-          if ((Test-Path $Config.ZipPath) -and -not (Test-Path $newZip)) { Move-Item $Config.ZipPath $newZip }
+          # The old download isn't carried over: the next one is downloaded fresh and verified
+          if ((Test-Path $Config.ZipPath) -and $newZip -ne $Config.ZipPath) { Remove-Item -LiteralPath $Config.ZipPath -Force -ErrorAction SilentlyContinue }
           $Config.ZipPath = $newZip
           Save-Config
+          Initialize-ZipFolder
           Ok "Saved. Runner download location: $newZip"
         }
       }
@@ -1600,6 +1805,10 @@ if ($cli) { $script:Quiet = $true }
 
 if ($Help) { Show-Usage; exit 0 }
 if (-not (Test-Prerequisites)) { if (-not $cli) { Read-Host "Press Enter to exit" }; exit 1 }
+# This script runs as Administrator, so other users must not be able to change it or its settings
+if (Test-WritableByOthers $ScriptDir) {
+  Repair-OneFolder @{ Path = $ScriptDir; Writers = @(); Names = $script:ScriptFolderFiles; What = "this script and its settings" }
+}
 if (-not (Initialize-Account)) { if (-not $cli) { Read-Host "Press Enter to exit" }; exit 1 }
 Update-OldKeys
 
