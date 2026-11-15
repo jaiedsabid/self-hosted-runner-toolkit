@@ -340,16 +340,36 @@ select_account() {
   printf '%s\n' "$accts" | sed -n "${c}p"
 }
 
+# GitHub CLI's own active account (read locally, no network needed)
+gh_active_account() {
+  env -u GH_TOKEN gh auth status -h github.com 2>&1 | awk '
+    { for (i = 1; i < NF; i++) if ($i == "account") a = $(i + 1) }
+    /Active account: true/ { print a; exit }'
+}
+
 grant_org_permission() {
-  local login; login=$(select_account "Give which account permission to manage organization runners?")
+  local login prev switched=0
+  login=$(select_account "Give which account permission to manage organization runners?")
   [ -z "$login" ] && return
-  env -u GH_TOKEN gh auth switch -h github.com -u "$login" >/dev/null 2>&1
+  # "gh auth refresh" only works on GitHub CLI's active account, so switch to
+  # $login for the refresh and switch back afterwards
+  prev=$(gh_active_account)
+  if [ "$(lower "$prev")" != "$(lower "$login")" ]; then
+    if ! env -u GH_TOKEN gh auth switch -h github.com -u "$login" >/dev/null 2>&1; then
+      fail "Couldn't switch GitHub CLI to $login."; return
+    fi
+    switched=1
+  fi
   info "A browser window opens to approve the extra permission (admin:org)."
   if env -u GH_TOKEN gh auth refresh -h github.com -s admin:org; then
     _LAST_LOGIN=""
     ok "$login can now manage organization runners."
   else
     fail "That didn't complete."
+  fi
+  if [ "$switched" = "1" ] && [ -n "$prev" ]; then
+    env -u GH_TOKEN gh auth switch -h github.com -u "$prev" >/dev/null 2>&1 ||
+      warn "GitHub CLI's active account is now $login (couldn't switch back to $prev)."
   fi
 }
 
@@ -441,7 +461,27 @@ init_account() {
     fail "Couldn't get a sign-in token for $(active_account). Sign in again from Accounts, or run: gh auth login"
     return 1
   fi
+
+  # Having a saved token doesn't mean GitHub still accepts it
+  if [ "$(sign_in_state)" = "expired" ]; then
+    fail "GitHub no longer accepts the sign-in for $(active_account) (it expired or was revoked)."
+    if [ "$QUIET" = "1" ]; then fail "Run the script without options once and sign in again."; return 1; fi
+    [ "$(ask "Sign in again now? (y/n) ")" = "y" ] || return 1
+    add_account || return 1
+    [ "$(sign_in_state)" = "expired" ] && { fail "The sign-in still isn't accepted."; return 1; }
+  fi
   return 0
+}
+
+# Asks GitHub whether the current token works: prints ok, expired, or unknown
+# (unknown = couldn't tell, e.g. no network; a warning is shown and the script carries on)
+sign_in_state() {
+  local err
+  if err=$(gh api user --jq .login 2>&1 >/dev/null); then echo ok; return; fi
+  case "$err" in
+    *"HTTP 401"*|*"Bad credentials"*) echo expired ;;
+    *) warn "Couldn't check the GitHub sign-in: $(printf '%s' "$err" | head -1)"; echo unknown ;;
+  esac
 }
 
 # Checks the repo/org exists and the managing account can manage its runners
@@ -712,13 +752,22 @@ select_runner() {
 
 # Lists repos the active account can manage; prints the picked ones
 select_repos() {
-  local owner repos r i=0 mark answer n arr=()
+  local owner repos r i=0 mark answer n arr=() err
   owner=$(ask "Whose repos? GitHub user or org name [Enter = $(active_account)]: ")
   owner=$(trim "$owner"); [ -z "$owner" ] && owner=$(active_account)
   use_account "$(active_account)"
   info "Loading repos where $(active_account) is an admin..."
-  repos=$(gh repo list "$owner" --limit 300 --json nameWithOwner,viewerPermission,isArchived \
-    --jq '.[] | select(.viewerPermission == "ADMIN" and (.isArchived | not)) | .nameWithOwner' 2>/dev/null | sort -f)
+  # Keep gh's error message: a failed call (expired sign-in, no network, unknown
+  # owner) must not look the same as "you're not an admin of any repo"
+  err=$(mktemp)
+  if ! repos=$(gh repo list "$owner" --limit 300 --json nameWithOwner,viewerPermission,isArchived \
+      --jq '.[] | select(.viewerPermission == "ADMIN" and (.isArchived | not)) | .nameWithOwner' 2>"$err"); then
+    fail "Could not list repos for $owner."
+    [ -s "$err" ] && dim "  GitHub CLI said: $(head -3 "$err")"
+    rm -f "$err"; return 1
+  fi
+  rm -f "$err"
+  repos=$(printf '%s\n' "$repos" | grep -v '^$' | sort -f)
   [ -z "$repos" ] && { warn "No repos found where $(active_account) is an admin of $owner's repos."; return 1; }
 
   say ""
