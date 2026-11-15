@@ -635,7 +635,9 @@ function Select-Repos {
   $json = (gh repo list $owner.Trim() --limit 300 --json "nameWithOwner,viewerPermission,isArchived" 2>$null) -join "`n"
   if ($LASTEXITCODE -ne 0 -or -not $json) { Fail "Could not list repos for $owner."; return @() }
 
-  $repos = @($json | ConvertFrom-Json |
+  # Parentheses matter: Windows PowerShell 5.1 passes the parsed JSON array down the
+  # pipeline as ONE object, so without them the filter below sees the whole list at once.
+  $repos = @(($json | ConvertFrom-Json) |
     Where-Object { $_.viewerPermission -eq "ADMIN" -and -not $_.isArchived } |
     ForEach-Object { $_.nameWithOwner } | Sort-Object)
   if ($repos.Count -eq 0) { Warn "No repos found where $($Config.ActiveAccount) is an admin."; return @() }
