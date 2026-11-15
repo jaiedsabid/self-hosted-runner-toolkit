@@ -60,7 +60,7 @@ Both scripts have the same features:
 - **Multiple GitHub accounts:** sign in to several, switch between them, and each runner remembers which account manages it.
 - **Add runners in bulk:** pick repos from a list (`1,3,5`, `2-4` or `all`), type `owner/repo`, paste a GitHub URL, or add an **organization runner**.
 - **Choose where runners live:** a default folder, or a different folder per runner, plus moving a runner later.
-- **Runner download:** downloads the latest version automatically, or uses **a download link you paste**, or **a file you already have**, with optional **SHA-256 checksum** verification.
+- **Runner download:** downloads the latest version automatically, or uses **a download link you paste**, or **a file you already have**, and every file is checked against its **SHA-256 checksum** before it's used.
 - **Background services:** start, stop and restart one runner or all of them; they start automatically after a reboot.
 - **Status at a glance:** service state, GitHub's view (Online / Busy / Offline), labels, account and folder for every runner.
 - **Labels:** set custom labels like `php8` or `swift` and get the matching `runs-on:` line.
@@ -77,14 +77,14 @@ Both scripts have the same features:
 
 ### Windows
 
-1. Download [`runner-manager.ps1`](runner-manager.ps1). In PowerShell:
+1. Open **PowerShell as Administrator** and download [`runner-manager.ps1`](runner-manager.ps1) into a folder only Administrators can change:
    ```powershell
-   mkdir C:\runner-manager -Force; cd C:\runner-manager
+   mkdir "$env:ProgramFiles\runner-manager" -Force; cd "$env:ProgramFiles\runner-manager"
    Invoke-WebRequest https://raw.githubusercontent.com/jaiedsabid/self-hosted-runner-toolkit/main/runner-manager.ps1 -OutFile runner-manager.ps1
    ```
-2. Open **PowerShell as Administrator** and run:
+   Don't keep it in a folder like `C:\runner-manager`: Windows lets every user of the PC change files in folders created directly under `C:\`, and the script runs as Administrator. If it finds itself in such a folder, it offers to lock the folder down.
+2. In the same Administrator window, run:
    ```powershell
-   cd C:\runner-manager
    powershell -ExecutionPolicy Bypass -File .\runner-manager.ps1
    ```
    `-ExecutionPolicy Bypass` lets this one script run without changing your system settings.
@@ -225,7 +225,7 @@ Every runner is set up from GitHub's official runner package (`actions-runner-<o
 2. **Paste a download link**, for example copied from a repo's *Settings → Actions → Runners → New self-hosted runner* page or from the releases page. Useful for pinning a version or behind restrictive networks.
 3. **Use a file already on this computer**, for offline or air-gapped setups. On macOS you can drag the file into the Terminal window.
 
-For options 2 and 3 you can paste the **SHA-256 checksum** shown on the releases page, and the script verifies it. It also checks that the file really is a runner package for your OS and CPU (`win-x64`, `win-arm64`, `osx-arm64`, `osx-x64`, `linux-x64`, `linux-arm64`, `linux-arm`) before using it.
+Every package is checked against its **SHA-256 checksum** before it's used. For official release files (option 1, a link to `github.com/actions/runner/releases`, or a file with its original name) the script looks up GitHub's published checksum itself. For a link to any other site, or a renamed file, you must paste the checksum. It also checks that the file really is a runner package for your OS and CPU (`win-x64`, `win-arm64`, `osx-arm64`, `osx-x64`, `linux-x64`, `linux-arm64`, `linux-arm`) before using it.
 
 ### Where things are stored
 
@@ -342,7 +342,9 @@ jobs:
 | "Couldn't get a sign-in token" | GitHub CLI older than 2.40, or sign-in expired | Update GitHub CLI, or **A → Sign in** again |
 | "GitHub no longer accepts the sign-in for …" | The account's sign-in expired or was revoked | Answer **y** to sign in again, or use **A → Sign in to another account** with the same account |
 | "Could not list repos for …" | The line below it shows GitHub CLI's reason: wrong user/org name, no network, or a sign-in problem | Fix what it says, or choose **Type a repo** instead |
-| Checksum doesn't match | Wrong file or broken download | Download again, and copy the checksum for the exact file |
+| Checksum doesn't match | Wrong file, broken download, or a file that was changed | Download again from github.com/actions/runner/releases, and copy the checksum for the exact file |
+| "… is a PUBLIC repo" when adding a runner | Self-hosted runners on public repos let anyone run code on your machine | Use a private repo. In the menu you can type `public` to go ahead anyway; command-line mode always refuses |
+| "Other users of this PC can change files in …" (Windows) | The folder lets every user change files the script or runners run as Administrator/service | Accept the fix, or move the script to `C:\Program Files\runner-manager` |
 
 ---
 
@@ -359,11 +361,12 @@ Free tiers change often, so check each provider's current terms.
 
 ## Security
 
-- **Don't use self-hosted runners on public repos.** Anyone who opens a pull request from a fork could run code on your machine. Keep them for private repos, or require approval for fork workflows.
-- **Tokens are never written to disk.** The scripts get short-lived registration tokens through GitHub CLI and keep account tokens in memory only.
+- **Don't use self-hosted runners on public repos.** Anyone who opens a pull request from a fork could run code on your machine. Keep them for private repos, or require approval for fork workflows. The scripts warn you and ask you to type `public` before adding a runner to a public repo, and refuse in command-line mode.
+- **Tokens are never written to disk.** The scripts get short-lived registration tokens through GitHub CLI and keep account tokens in memory only. Registration tokens and the Windows service password are handed to the runner in environment variables, never on the command line, so other users and process logs can't see them.
+- **Windows folder permissions:** runner folders and the download folder are limited to Administrators, SYSTEM and the runner's service account, so other users of the PC can't change programs that run as a service. The health check finds and fixes folders that other users can change.
 - **The Windows service password** (only if you choose to run services as your account) is asked once per session and kept in memory only.
 - **The settings file** contains folders, account names and labels only. It's in `.gitignore` in case you run the script inside a clone of this repo.
-- Runners are downloaded from GitHub's official `actions/runner` releases, or from a link or file you choose, with optional checksum verification.
+- Runners are downloaded from GitHub's official `actions/runner` releases, or from a link or file you choose. Every package and the GitHub CLI download is checked against its SHA-256 checksum before it's used.
 
 ---
 

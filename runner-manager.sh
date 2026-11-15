@@ -209,6 +209,18 @@ install_gh() {
 
   tmp=$(mktemp -d)
   if ! curl -fsSL -o "$tmp/gh-archive" "$url"; then fail "Download failed."; rm -rf "$tmp"; return 1; fi
+  # Check the download against the checksum list published with the same release
+  local name sums expected
+  name=$(basename "$url")
+  sums="${url%/*}/$(printf '%s' "$name" | sed -E 's/^(gh_[0-9.]+)_.*/\1/')_checksums.txt"
+  expected=$(curl -fsSL "$sums" 2>/dev/null | awk -v f="$name" '$2 == f { print $1; exit }')
+  if [ -z "$expected" ]; then
+    fail "Couldn't get the checksum for $name, so it was not installed."; rm -rf "$tmp"; return 1
+  fi
+  if [ "$(lower "$expected")" != "$(sha256_of "$tmp/gh-archive")" ]; then
+    fail "The GitHub CLI download doesn't match its published checksum. It was not installed."; rm -rf "$tmp"; return 1
+  fi
+  ok "Checksum OK."
   if is_mac; then unzip -q "$tmp/gh-archive" -d "$tmp" || { rm -rf "$tmp"; return 1; }
   else tar -xzf "$tmp/gh-archive" -C "$tmp" || { rm -rf "$tmp"; return 1; }; fi
 
@@ -498,12 +510,27 @@ test_access() {
     fi
     return 0
   fi
-  if ! admin=$(gh api "repos/$key" --jq .permissions.admin 2>/dev/null); then
+  local info private
+  if ! info=$(gh api "repos/$key" --jq '"\(.permissions.admin) \(.private)"' 2>/dev/null); then
     fail "Repo $key not found (or $login can't see it). Check the name."
     return 1
   fi
+  admin=${info% *}; private=${info#* }
   [ "$admin" = "true" ] || { fail "$login needs admin access to $key to manage its runner."; return 1; }
+  [ "$private" = "true" ] || public_repo_ok "$key" || return 1
   return 0
+}
+
+# A runner on a public repo lets anyone who opens a pull request from a fork run code on this machine
+public_repo_ok() {   # key
+  warn "WARNING: $1 is a PUBLIC repo."
+  warn "Anyone can fork it and open a pull request whose workflow runs on this machine,"
+  warn "with access to its files and network. GitHub advises against self-hosted runners on public repos."
+  if [ "$QUIET" = "1" ]; then
+    fail "Not adding a runner to a public repo in command-line mode. Run the script without options to confirm."
+    return 1
+  fi
+  [ "$(ask "Type 'public' to add the runner anyway, or press Enter to cancel: ")" = "public" ]
 }
 
 # =====================================================================
@@ -557,12 +584,23 @@ read_folder() {
 
 folder_empty() { [ ! -d "$1" ] || [ -z "$(ls -A "$1" 2>/dev/null)" ]; }
 
+# Deletes a runner folder. Refuses system folders, your home folder and its parents,
+# and anything that doesn't look like a runner folder (no config.sh or .runner inside).
 safe_rm() {
-  case "$1" in
-    ""|"/"|"$HOME"|"$HOME/") fail "Refusing to delete '$1'."; return 1 ;;
+  local p home
+  # Resolve "..", symlinks and trailing slashes so the checks below see the real folder
+  if [ -d "$1" ]; then p=$(cd "$1" 2>/dev/null && pwd -P); else p="${1%/}"; fi
+  home=$(cd "$HOME" 2>/dev/null && pwd -P)
+  case "$p" in
+    ""|"/"|"$HOME"|"$home"|/bin|/sbin|/usr|/usr/*|/etc|/etc/*|/var|/opt|/tmp|/private|/private/etc|/private/var|/private/tmp|/System|/System/*|/Library|/Applications|/Users|/home|/root)
+      fail "Refusing to delete '$1'."; return 1 ;;
   esac
-  rm -rf "$1" 2>/dev/null
-  [ ! -e "$1" ]
+  case "$home/" in "$p"/*) fail "Refusing to delete '$1' (it contains your home folder)."; return 1 ;; esac
+  if [ -d "$p" ] && [ ! -f "$p/config.sh" ] && [ ! -f "$p/.runner" ]; then
+    fail "Refusing to delete '$1': it doesn't look like a runner folder."; return 1
+  fi
+  rm -rf "$p" 2>/dev/null
+  [ ! -e "$p" ]
 }
 
 # Asks where to put one or more runners. Fills PLAN_KEYS / PLAN_DIRS. Returns 1 if cancelled.
@@ -726,9 +764,10 @@ svc_cmd() {   # key action [args]
 github_runner() {   # key [name]
   local name="${2:-$(runner_name "$1")}"
   use_key_account "$1"
+  # The name is matched in awk, not written into the jq filter, so no name can change the filter
   gh api "$(api_base "$1")/actions/runners?per_page=100" \
-    --jq ".runners[] | select(.name == \"$name\") | \"\(.id)|\(.status)|\(.busy)|\([.labels[] | select(.type == \"custom\") | .name] | join(\",\"))\"" \
-    2>/dev/null | head -1
+    --jq '.runners[] | "\(.name)|\(.id)|\(.status)|\(.busy)|\([.labels[] | select(.type == "custom") | .name] | join(","))"' \
+    2>/dev/null | RUNNER_NAME="$name" awk -F'|' '$1 == ENVIRON["RUNNER_NAME"] { print substr($0, length($1) + 2); exit }'
 }
 
 # Numbered list of runners; prints the chosen key(s). Pass "all" as $2 to allow choosing all.
@@ -786,13 +825,14 @@ resolve_targets() { if [ "$1" = "all" ]; then installed_keys; else full_key "$1"
 # =====================================================================
 #  Runner download
 # =====================================================================
-verify_archive() {   # file [checksum]
+# Every runner package is checked against a SHA-256 checksum before it's used. The checksum
+# comes from GitHub's release data when the file is an official release, otherwise you paste it.
+verify_archive() {   # file checksum
   local sum
   sum=$(printf '%s' "$2" | grep -oE '[0-9a-fA-F]{64}' | head -1)
-  if [ -n "$sum" ]; then
-    if [ "$(lower "$sum")" != "$(sha256_of "$1")" ]; then fail "Checksum doesn't match. The file was not used."; return 1; fi
-    ok "Checksum OK."
-  fi
+  [ -z "$sum" ] && { fail "No checksum to check the file against. The file was not used."; return 1; }
+  if [ "$(lower "$sum")" != "$(sha256_of "$1")" ]; then fail "Checksum doesn't match. The file was not used."; return 1; fi
+  ok "Checksum OK."
   if ! tar -tzf "$1" 2>/dev/null | grep -q '^\(\./\)\{0,1\}config\.sh$'; then
     fail "That file doesn't look like a GitHub runner package (no config.sh inside)."
     return 1
@@ -800,17 +840,39 @@ verify_archive() {   # file [checksum]
   return 0
 }
 
+# GitHub's published SHA-256 for an official runner file name, e.g.
+# actions-runner-osx-arm64-2.330.0.tar.gz (empty if it isn't an official file)
+official_digest() {   # file name
+  local name="$1" ver
+  ver=$(printf '%s' "$name" | sed -nE "s/^actions-runner-[a-z0-9]+-[a-z0-9]+-([0-9]+\.[0-9]+\.[0-9]+)\.tar\.gz$/\1/p")
+  [ -z "$ver" ] && return 0
+  gh api "repos/actions/runner/releases/tags/v$ver" --jq '.assets[] | "\(.name) \(.digest // "")"' 2>/dev/null |
+    awk -v f="$name" '$1 == f { sub(/^sha256:/, "", $2); print $2; exit }'
+}
+
+# The checksum for a file you supplied: GitHub's own if it's an official release, else you paste one
+checksum_for() {   # file name
+  local sum
+  sum=$(official_digest "$1")
+  if [ -n "$sum" ]; then info "Using GitHub's published checksum for $1."; printf '%s' "$sum"; return; fi
+  warn "$1 isn't a file name from GitHub's runner releases, so its checksum can't be looked up."
+  ask "SHA-256 checksum to verify (required; from the release page or whoever gave you the file): "
+}
+
 download_latest_archive() {
-  local path url
+  local path url digest
   path=$(archive_path)
   info "Finding the latest GitHub runner for $PLATFORM..."
-  url=$(gh api repos/actions/runner/releases/latest --jq '.assets[].browser_download_url' 2>/dev/null |
-        grep -E "/actions-runner-${PLATFORM}-[0-9.]+\.tar\.gz$" | head -1)
+  read -r url digest <<EOF
+$(gh api repos/actions/runner/releases/latest --jq '.assets[] | "\(.browser_download_url) \(.digest // "")"' 2>/dev/null |
+  grep -E "/actions-runner-${PLATFORM}-[0-9.]+\.tar\.gz " | head -1)
+EOF
   [ -z "$url" ] && { fail "Couldn't find the $PLATFORM runner download."; return 1; }
+  [ -z "$digest" ] && { fail "GitHub didn't publish a checksum for $(basename "$url"), so it can't be verified."; return 1; }
   mkdir -p "$(dirname "$path")"
   info "Downloading $(basename "$url")..."
   if ! curl -fL --progress-bar -o "$path.part" "$url"; then fail "Download failed."; rm -f "$path.part"; return 1; fi
-  verify_archive "$path.part" "" || { rm -f "$path.part"; return 1; }
+  verify_archive "$path.part" "$digest" || { rm -f "$path.part"; return 1; }
   mv "$path.part" "$path"
   ok "Saved to $path"
 }
@@ -823,14 +885,23 @@ download_from_link() {
   url=$(trim "$(ask "Download link: ")")
   case "$url" in https://*) ;; *) fail "The link should start with https://"; return 1 ;; esac
   case "$url" in
+    https://github.com/actions/runner/releases/download/*) ;;
+    *) warn "This link isn't from github.com/actions/runner/releases. You'll need the file's SHA-256 checksum." ;;
+  esac
+  case "$url" in
     *"actions-runner-$PLATFORM-"*) ;;
     *) warn "This link doesn't look like the $PLATFORM runner (expected 'actions-runner-$PLATFORM-' in it)."
        [ "$(ask "Use it anyway? (y/n) ")" = "y" ] || return 1 ;;
   esac
+  # Only trust GitHub's published checksum when the file really comes from GitHub's releases
+  case "$url" in
+    https://github.com/actions/runner/releases/download/*) sum=$(checksum_for "$(basename "${url%%\?*}")") ;;
+    *) sum=$(ask "SHA-256 checksum to verify (required): ") ;;
+  esac
+  [ -z "$(trim "$sum")" ] && { fail "A checksum is needed to use this file."; return 1; }
   mkdir -p "$(dirname "$path")"
   info "Downloading..."
   if ! curl -fL --progress-bar -o "$path.part" "$url"; then fail "Download failed. Check the link."; rm -f "$path.part"; return 1; fi
-  sum=$(ask "SHA-256 checksum to verify (optional, shown on GitHub's release page; Enter to skip): ")
   verify_archive "$path.part" "$sum" || { rm -f "$path.part"; return 1; }
   mv "$path.part" "$path"
   ok "Saved to $path"
@@ -841,7 +912,8 @@ use_local_archive() {
   path=$(archive_path)
   src=$(clean_path "$(ask "Path to the runner .tar.gz file (you can drag it into this window): ")")
   [ -f "$src" ] || { fail "File not found: $src"; return 1; }
-  sum=$(ask "SHA-256 checksum to verify (optional; Enter to skip): ")
+  sum=$(checksum_for "$(basename "$src")")
+  [ -z "$(trim "$sum")" ] && { fail "A checksum is needed to use this file."; return 1; }
   verify_archive "$src" "$sum" || return 1
   mkdir -p "$(dirname "$path")"
   cp "$src" "$path" && ok "Copied to $path"
@@ -955,7 +1027,9 @@ install_runner() {
   local extra=()
   [ -n "$labels" ] && extra=(--labels "$labels")
 
-  if ! ( cd "$dir" && ./config.sh --unattended --url "$(target_url "$key")" --token "$token" \
+  # The token goes in the environment, not the command line, where other users could see it
+  # with "ps". The runner reads ACTIONS_RUNNER_INPUT_<option> and removes it from its environment.
+  if ! ( cd "$dir" && ACTIONS_RUNNER_INPUT_TOKEN="$token" ./config.sh --unattended --url "$(target_url "$key")" \
            --name "$(new_runner_name "$key")" --replace "${extra[@]}" ); then
     fail "Setup failed for $label (see messages above)."
     reset_cache
@@ -1007,7 +1081,7 @@ remove_runner() {   # key [forget]
   # 2. Unregister from GitHub
   if [ -f "$dir/.runner" ]; then
     token=$(gh api -X POST "$(api_base "$key")/actions/runners/remove-token" --jq .token 2>/dev/null)
-    [ -n "$token" ] && ( cd "$dir" && ./config.sh remove --token "$token" )
+    [ -n "$token" ] && ( cd "$dir" && ACTIONS_RUNNER_INPUT_TOKEN="$token" ./config.sh remove )
   fi
   gr=$(github_runner "$key" "$name")
   [ -n "$gr" ] && gh api -X DELETE "$(api_base "$key")/actions/runners/${gr%%|*}" >/dev/null 2>&1
