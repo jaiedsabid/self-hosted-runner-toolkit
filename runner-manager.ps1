@@ -464,10 +464,11 @@ function Test-Access($key) {
     }
     return $true
   }
-  # (no double quotes in the jq filter: Windows PowerShell 5.1 doesn't pass them through to programs)
-  $info = gh api "repos/$key" --jq '[.permissions.admin, .private] | map(tostring) | join(",")' 2>$null
-  if ($LASTEXITCODE -ne 0 -or -not $info) { Fail "Repo $key not found (or $login can't see it). Check the name."; return $false }
-  $admin, $private = "$info".Trim() -split ','
+  # Never put double quotes in a jq filter here: Windows PowerShell 5.1 drops them when it
+  # passes arguments to programs, which breaks the filter. This one prints two lines.
+  $info = @(gh api "repos/$key" --jq '.permissions.admin, .private' 2>$null)
+  if ($LASTEXITCODE -ne 0 -or $info.Count -lt 2) { Fail "Repo $key not found (or $login can't see it). Check the name."; return $false }
+  $admin = "$($info[0])".Trim(); $private = "$($info[1])".Trim()
   if ($admin -ne "true") { Fail "$login needs admin access to $key to manage its runner."; return $false }
   if ($private -ne "true" -and -not (Confirm-PublicRepo $key)) { return $false }
   return $true
